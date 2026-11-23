@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
 from synapseclient import Synapse
@@ -54,13 +55,7 @@ from synapseclient.models import (
     TaskState,
     Team,
 )
-from synapseclient.models.curation import (
-    GridQueryResult,
-    GridQueryValidationResult,
-    GridRow,
-    SelectAll,
-    SyncType,
-)
+from synapseclient.models.curation import GridQueryResult, GridRow, SyncType
 
 HEADER = (
     "name,project_id,folder_id,curation_task_name,record_set_name,schema_uri,"
@@ -584,29 +579,38 @@ def _lab_b(folder: Path, **overrides) -> CurationTaskRow:
     return _task_row(folder, **fields)
 
 
-def _grid_row(
-    key: str, valid: bool | None = True, message: str = "", details=None
-) -> GridRow:
-    """A session row keyed `specimenID`: valid, invalid with Synapse's messages, or
-    not yet validated when `valid` is None."""
-    results = None
-    if valid is not None:
-        results = GridQueryValidationResult(
-            is_valid=valid,
-            validation_error_message=None if valid else message,
-            all_validation_messages=None if valid else details,
-        )
-    return GridRow(
-        row_id=f"7.{key}", data={"specimenID": key}, validation_results=results
-    )
+REPORT_COLUMNS = [
+    "row_index",
+    "is_valid",
+    "validation_error_message",
+    "all_validation_messages",
+]
+
+
+def _report_row(
+    index: int, valid: bool | None = True, message: str | None = None, details=None
+) -> dict:
+    """A validation report row for the table's `index`th row: valid, invalid with
+    Synapse's messages, or without a result when `valid` is None."""
+    return {
+        "row_index": index,
+        "is_valid": valid,
+        "validation_error_message": message,
+        "all_validation_messages": details,
+    }
 
 
 class _SynapseMocks:
     """Mocks every Synapse call planning and applying make, recording each call
     that writes, and each table read, in `self.calls`.
 
-    A session returns the rows imported into it, every one valid, unless a test
-    sets `self.validation_reads` to what each read of the session returns.
+    A read of a connected session returns the rows imported into it, unless a
+    test sets `self.session_texts` to the CSV each read returns, the last
+    repeating.
+
+    A table read after a synchronize finds a validation report with every row
+    valid, unless a test sets `self.reports` to what each such read finds: a list
+    of report rows, or None for no report.
 
     A step named in `self.fail_at` raises its exception once. Until a test says
     otherwise, planning finds every folder editable, every team and schema present
@@ -635,19 +639,20 @@ class _SynapseMocks:
         self.archived: list[tuple[int, TaskState]] = []
         self.created: list[dict] = []
         self.imported: list[dict] = []
-        self.import_count: int | None = None
-        self.validation_reads: list[list[GridRow]] | None = None
+        self.session_texts: list[str] | None = None
         self.read_index = 0
-        self.queries = []
+        self.reports: list[list[dict] | None] | None = None
+        self.report_index = 0
+        self.report: list[dict] | None = None
         self.sync_types = []
-        self.sync_errors: list[str] = []
         self.deleted_sessions: list[str] = []
         self.table_text: str | None = None
         self.read_ids: list[str] = []
         self.temp = tmp_path / "temp"
         self.temp.mkdir()
         mocker.patch.object(tempfile, "tempdir", str(self.temp))
-        mocker.patch.object(curation_tasks, "_VALIDATION_POLL_SECONDS", 0)
+        mocker.patch.object(curation_tasks, "_REPORT_POLL_SECONDS", 0)
+        mocker.patch.object(curation_tasks, "_IMPORT_POLL_SECONDS", 0)
 
         step = self._step
 
@@ -702,7 +707,6 @@ class _SynapseMocks:
 
         async def import_csv(grid: Grid, path: str, **kwargs) -> Grid:
             step("import")
-            _, records = read_csv_records(path)
             self.imported.append(
                 dict(
                     path=path,
@@ -710,8 +714,6 @@ class _SynapseMocks:
                     column_types=kwargs.get("column_types"),
                 )
             )
-            count = self.import_count
-            grid.import_total_count = len(records) if count is None else count
             return grid
 
         @asynccontextmanager
@@ -719,15 +721,19 @@ class _SynapseMocks:
             step("connect")
             yield grid
 
-        async def validate_rows(grid: Grid, *, query_request, **kwargs):
-            step("validate")
+        async def query_session(grid: Grid, *, query_request, **kwargs):
+            step("query")
+            texts = self.session_texts
+            if texts is None:
+                text = self.imported[-1]["text"]
+            else:
+                text = texts[min(self.read_index, len(texts) - 1)]
+            header, *cells = list(csv.reader(io.StringIO(text)))
+            rows = [
+                GridRow(row_id=f"7.{number}", data=dict(zip(header, row)))
+                for number, row in enumerate(cells)
+            ]
             query = query_request.query
-            self.queries.append(query)
-            reads = self.validation_reads
-            if reads is None:
-                _, records = read_csv_records(self.imported[-1]["path"])
-                reads = [[_grid_row(record.cells[0]) for record in records]]
-            rows = reads[min(self.read_index, len(reads) - 1)]
             page = rows[query.offset : query.offset + query.limit]
             if len(page) < query.limit:
                 self.read_index += 1
@@ -736,9 +742,7 @@ class _SynapseMocks:
         async def synchronize(grid: Grid, **kwargs) -> Grid:
             step("synchronize")
             self.sync_types.append(kwargs.get("sync_type"))
-            grid.sync_error_messages = list(self.sync_errors)
-            if not self.sync_errors:
-                self._synchronized()
+            self._synchronized()
             return grid
 
         async def delete_grid(grid: Grid, **kwargs) -> None:
@@ -753,7 +757,16 @@ class _SynapseMocks:
             record_set.path = str(file)
             record_set.upsert_keys = list(self.table_keys)
             record_set.parent_id = self.table_folder
+            written = "synchronize" in self.calls
+            self.report = self._next_report(file) if written else None
+            record_set.validation_file_handle_id = (
+                None if self.report is None else "fh-report"
+            )
             return record_set
+
+        async def get_report(record_set: RecordSet, **kwargs) -> pd.DataFrame:
+            step("record_set.report")
+            return pd.DataFrame(self.report, columns=REPORT_COLUMNS)
 
         async def get_status(task: CurationTask, **kwargs) -> CurationTaskStatus:
             if task.task_id in self.status_errors:
@@ -810,7 +823,7 @@ class _SynapseMocks:
         )
         mocker.patch.object(Grid, "connect_async", new=connect)
         mocker.patch.object(
-            Grid, "validate_rows_async", autospec=True, side_effect=validate_rows
+            Grid, "validate_rows_async", autospec=True, side_effect=query_session
         )
         mocker.patch.object(
             Grid, "synchronize_async", autospec=True, side_effect=synchronize
@@ -820,6 +833,12 @@ class _SynapseMocks:
         )
         mocker.patch.object(
             RecordSet, "get_async", autospec=True, side_effect=get_record_set
+        )
+        mocker.patch.object(
+            RecordSet,
+            "get_detailed_validation_results_async",
+            autospec=True,
+            side_effect=get_report,
         )
         mocker.patch.object(
             CurationTask, "get_status_async", autospec=True, side_effect=get_status
@@ -843,6 +862,16 @@ class _SynapseMocks:
         error = self.fail_at.pop(name, None)
         if error is not None:
             raise error
+
+    def _next_report(self, table: Path) -> list[dict] | None:
+        """The report the next read of a written table finds: the next of
+        `self.reports`, the last repeating, or else every row of `table` valid."""
+        if self.reports is None:
+            _, records = read_csv_records(str(table))
+            return [_report_row(index) for index in range(len(records))]
+        report = self.reports[min(self.report_index, len(self.reports) - 1)]
+        self.report_index += 1
+        return report
 
     def _table_text(self) -> str:
         """What a table download holds: `self.table_text`, or else the last import."""
@@ -880,8 +909,6 @@ WRITE_STEPS = {
     "create_task",
     "grid.create",
     "import",
-    "connect",
-    "validate",
     "synchronize",
     "grid.delete",
     "archive",
@@ -891,10 +918,11 @@ GRID_FLOW = [
     "grid.create",
     "import",
     "connect",
-    "validate",
+    "query",
     "synchronize",
     "grid.delete",
     "record_set.get",
+    "record_set.report",
 ]
 
 
@@ -1961,40 +1989,48 @@ class TestApplyNewTasks(_SynapseMocks):
             "tags": ColumnType.STRING_LIST,
         }
 
-    async def test_validation_problems_are_read_until_every_row_has_a_result(
-        self, mocker, tmp_path: Path
+    async def test_validation_problems_come_from_the_tables_report(
+        self, tmp_path: Path
     ) -> None:
-        # GIVEN a session whose rows are validated only on the second read, one
-        # invalid row from the file and one invalid row the file lacks, read two
-        # rows a page
-        mocker.patch.object(curation_tasks, "_VALIDATION_PAGE_SIZE", 2)
+        # GIVEN a written table that also holds a row the file lacks, whose report
+        # is missing on the first read and then names one invalid row from the file
+        # and the invalid row the file lacks
         row = _task_row(tmp_path)
-        self.validation_reads = [
-            [_grid_row("S1", None), _grid_row("S2", None), _grid_row("S9", True)],
+        self.table_text = _table_csv(
+            TABLE_HEADER,
             [
-                _grid_row("S1"),
-                _grid_row(
-                    "S2",
+                ["S1", "brain", "4", None],
+                ["S2", "liver", "5", None],
+                ["S9", "x", "", None],
+            ],
+        )
+        self.reports = [
+            None,
+            [
+                _report_row(0),
+                _report_row(
+                    1,
                     False,
                     "2 schema violations found",
-                    ["#/age: expected type: Integer, found: String", "#/tissue: x"],
+                    '["#/age: expected type: Integer, found: String", "#/tissue: x"]',
                 ),
-                _grid_row("S9", False, "string [x] does not match pattern ^[0-9]+$"),
+                _report_row(
+                    2,
+                    False,
+                    "string [x] does not match pattern ^[0-9]+$",
+                    "string [x] does not match pattern ^[0-9]+$",
+                ),
             ],
         ]
 
         # WHEN I apply it
         (outcome,) = await self._apply(row)
 
-        # THEN the rows are read in pages until a short page, and read again
-        # until every row has a result, with Synapse's messages asked for
-        assert [(q.offset, q.limit) for q in self.queries] == [(0, 2), (2, 2)] * 2
-        assert all(q.include_validation_messages for q in self.queries)
-        assert all(q.filters is None for q in self.queries)
-        assert all(q.column_selection == [SelectAll()] for q in self.queries)
+        # THEN the table is read again until its report covers it
+        assert self.calls == GRID_FLOW[:-1] + ["record_set.get", "record_set.report"]
 
         # AND each invalid row is a non-blocking validation problem, named by its
-        # file and line when the file has its key
+        # file and line when the file has its key, its messages each given once
         assert outcome.validation_problems == [
             CurationProblem(
                 task="lab_a",
@@ -2025,114 +2061,98 @@ class TestApplyNewTasks(_SynapseMocks):
         assert outcome.result is TaskResult.CREATED
         assert outcome.errors == []
 
+    @pytest.mark.parametrize(
+        "report, unvalidated",
+        [
+            pytest.param(None, 2, id="no report"),
+            pytest.param([_report_row(0)], 2, id="report of another version"),
+            pytest.param(
+                [_report_row(0), _report_row(1, None)], 1, id="row unvalidated"
+            ),
+        ],
+    )
     async def test_rows_not_validated_in_time_are_reported(
-        self, mocker, tmp_path: Path
+        self, mocker, tmp_path: Path, report: list | None, unvalidated: int
     ) -> None:
-        # GIVEN a session where one row never gets a result, and no time to wait
-        mocker.patch.object(curation_tasks, "_VALIDATION_WAIT_SECONDS", 0)
-        self.validation_reads = [[_grid_row("S1", None), _grid_row("S2")]]
+        # GIVEN a written table whose report never covers it, and no time to wait
+        mocker.patch.object(curation_tasks, "_REPORT_WAIT_SECONDS", 0)
+        self.reports = [report]
 
         # WHEN I apply a row
         (outcome,) = await self._apply(_task_row(tmp_path))
 
-        # THEN one more validation problem says how many rows were not validated,
-        # and the write goes on
+        # THEN one validation problem says how many rows were not validated, and
+        # the write stands
         assert [
             (p.kind, p.blocking, p.message) for p in outcome.validation_problems
         ] == [
             (
                 ProblemKind.VALIDATION,
                 False,
-                "lab_a: Synapse had not validated 1 of the 2 rows in table syn901 "
-                "after 0 seconds; their validation problems are not reported",
+                f"lab_a: Synapse had not validated {unvalidated} of the 2 rows in "
+                "table syn901 after 0 seconds; their validation problems are not "
+                "reported",
             )
         ]
-        assert self.calls == GRID_FLOW
+        assert self.calls.count("record_set.get") == 1
         assert outcome.result is TaskResult.CREATED
+        assert outcome.rows_written == 2
 
-    @pytest.mark.parametrize(
-        "reads, validate_calls, message",
-        [
-            pytest.param(
-                [[], [_grid_row("S1"), _grid_row("S2", False, "bad tissue")]],
-                2,
-                "lab_a: input file {path} line 3: key specimenID 'S2': bad tissue",
-                id="rows arrive on the second read",
-            ),
-            pytest.param(
-                [[]],
-                1,
-                "lab_a: Synapse had not validated 2 of the 2 rows in table syn901 "
-                "after 0 seconds; their validation problems are not reported",
-                id="rows never arrive",
-            ),
-            pytest.param(
-                [[_grid_row("S1")]],
-                1,
-                "lab_a: Synapse had not validated 1 of the 2 rows in table syn901 "
-                "after 0 seconds; their validation problems are not reported",
-                id="one row never arrives",
-            ),
-        ],
-    )
-    async def test_session_returning_fewer_rows_than_imported_is_read_again(
-        self, mocker, tmp_path: Path, reads: list, validate_calls: int, message: str
+    async def test_push_waits_for_the_session_to_hold_the_import(
+        self, tmp_path: Path
     ) -> None:
-        # GIVEN a session that at first returns fewer rows than were imported, and
-        # no time to wait unless the rows arrive on the second read
-        if len(reads) == 1:
-            mocker.patch.object(curation_tasks, "_VALIDATION_WAIT_SECONDS", 0)
-        self.validation_reads = reads
+        # GIVEN a session that holds the imported rows only on the second download
+        header = '"specimenID","tissue","age","individualID"\n'
+        self.session_texts = [
+            header,
+            header + '"S1","brain","4",""\n"S2","liver","5",""\n',
+        ]
+
+        # WHEN I apply a row
+        (outcome,) = await self._apply(_task_row(tmp_path))
+
+        # THEN the session is read again before it is synchronized
+        assert self.calls == GRID_FLOW[:5] + ["query"] + GRID_FLOW[5:]
+        assert outcome.result is TaskResult.CREATED
+        assert outcome.errors == []
+
+    async def test_import_the_session_never_holds_is_not_pushed(
+        self, mocker, tmp_path: Path
+    ) -> None:
+        # GIVEN a session that never holds one of the imported rows, and no time
+        # to wait
+        mocker.patch.object(curation_tasks, "_IMPORT_WAIT_SECONDS", 0)
+        self.session_texts = [
+            '"specimenID","tissue","age","individualID"\n"S1","brain","4",""\n'
+        ]
         row = _task_row(tmp_path)
 
         # WHEN I apply it
         (outcome,) = await self._apply(row)
 
-        # THEN the session is read until it returns the imported rows, and rows
-        # that never arrive are reported as not validated; the write goes on
-        assert self.calls.count("validate") == validate_calls
-        assert [p.message for p in outcome.validation_problems] == [
-            message.format(path=row.path)
+        # THEN the session is not synchronized, the task fails with the missing
+        # row, and the session is deleted
+        assert self.calls == [
+            "create_task",
+            "grid.create",
+            "import",
+            "connect",
+            "query",
+            "grid.delete",
         ]
-        assert outcome.result is TaskResult.CREATED
-        assert outcome.rows_written == 2
+        assert outcome.result is TaskResult.FAILED
+        assert outcome.rows_written == 0
+        assert outcome.errors == [
+            "grid session session-1 did not hold the imported rows after 0 seconds, "
+            "so it was not synchronized and table syn901 is unchanged: key "
+            f"specimenID 'S2' from input file {row.path} line 3 is not in grid "
+            "session session-1 after writing"
+        ]
+        self._assert_nothing_deleted_and_no_file_left()
 
-    @pytest.mark.parametrize(
-        "case, flow, rows_written, error",
-        [
-            (
-                "import count",
-                ["create_task", "grid.create", "import", "grid.delete"],
-                0,
-                "grid session session-1 imported 1 row, not the 2 written; it was not "
-                "synchronized, so table syn901 is unchanged",
-            ),
-            (
-                "sync errors",
-                GRID_FLOW[:-1],
-                0,
-                "synchronizing grid session session-1 into table syn901 failed: "
-                "Row 2: bad value",
-            ),
-            (
-                "key missing",
-                GRID_FLOW,
-                2,
-                "key specimenID 'S2' from input file {path} line 3 is not in table "
-                "syn901 after writing",
-            ),
-        ],
-    )
-    async def test_unconfirmed_write_fails_the_task(
-        self, tmp_path: Path, case: str, flow: list, rows_written: int, error: str
-    ) -> None:
-        # GIVEN a write Synapse does not confirm
-        if case == "import count":
-            self.import_count = 1
-        elif case == "sync errors":
-            self.sync_errors = ["Row 2: bad value"]
-        else:
-            self.table_text = '"specimenID","tissue","age","individualID"\n"S1",,,\n'
+    async def test_unconfirmed_write_fails_the_task(self, tmp_path: Path) -> None:
+        # GIVEN a write whose table, read back, lacks one of the rows written
+        self.table_text = '"specimenID","tissue","age","individualID"\n"S1",,,\n'
         row = _task_row(tmp_path)
 
         # WHEN I apply it
@@ -2142,9 +2162,12 @@ class TestApplyNewTasks(_SynapseMocks):
         assert outcome.result is TaskResult.FAILED
         assert outcome.task_id == 901
         assert outcome.record_set_id == "syn901"
-        assert outcome.rows_written == rows_written
-        assert outcome.errors == [error.format(path=row.path)]
-        assert self.calls == flow
+        assert outcome.rows_written == 2
+        assert outcome.errors == [
+            f"key specimenID 'S2' from input file {row.path} line 3 is not in table "
+            "syn901 after writing"
+        ]
+        assert self.calls == GRID_FLOW
         self._assert_nothing_deleted_and_no_file_left()
 
     @pytest.mark.parametrize(
@@ -2153,9 +2176,13 @@ class TestApplyNewTasks(_SynapseMocks):
             ("grid.create", "Synapse error while filling table syn901: 503 x"),
             ("import", "Synapse error while filling table syn901: 503 x"),
             ("connect", "Synapse error while filling table syn901: 503 x"),
-            ("validate", "Synapse error while filling table syn901: 503 x"),
+            ("query", "Synapse error while filling table syn901: 503 x"),
             ("synchronize", "Synapse error while filling table syn901: 503 x"),
             ("record_set.get", "Synapse error while reading table syn901 back: 503 x"),
+            (
+                "record_set.report",
+                "Synapse error while reading table syn901 back: 503 x",
+            ),
         ],
     )
     async def test_failed_step_cleans_up_and_others_finish(

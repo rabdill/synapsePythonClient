@@ -19,6 +19,7 @@ from typing import Any, Hashable, NamedTuple, Optional
 from synapseclient import Synapse
 from synapseclient.core.async_utils import wrap_async_to_sync
 from synapseclient.core.exceptions import SynapseHTTPError
+from synapseclient.core.typing_utils import DataFrame as DATA_FRAME_TYPE
 from synapseclient.extensions.curator.curation_task_types import (
     ArchiveEntry,
     ArchiveResult,
@@ -546,6 +547,20 @@ async def _plan_new_task(
     return plan, [_RowWrite(line, cells, {}) for line, cells in loaded.rows]
 
 
+class _ReportRow(NamedTuple):
+    """One row of a RecordSet's validation report.
+
+    Attributes:
+        index: The position of the row it describes among the table's records.
+        is_valid: Whether that row is valid; None when the report does not say.
+        messages: Synapse's messages for the row, its one-line message first.
+    """
+
+    index: int
+    is_valid: bool | None
+    messages: list[str]
+
+
 class _Table(NamedTuple):
     """An existing task's table, read from its RecordSet's CSV.
 
@@ -554,12 +569,15 @@ class _Table(NamedTuple):
         records: Its rows, each with the CSV line it starts on.
         upsert_keys: The RecordSet's key columns.
         parent_id: The folder that holds the RecordSet.
+        report: The RecordSet's validation report, when it was read and Synapse
+            had one.
     """
 
     header: list[str]
     records: list[CsvRecord]
     upsert_keys: list[str]
     parent_id: str | None
+    report: list[_ReportRow] | None = None
 
 
 class _RowWrite(NamedTuple):
@@ -1199,14 +1217,25 @@ async def plan_curation_tasks_async(
 
 # Filling a table
 
-_VALIDATION_PAGE_SIZE = 500
-"""Rows read per validation query."""
+_SESSION_PAGE_SIZE = 500
+"""Rows read per query of a grid session."""
 
-_VALIDATION_POLL_SECONDS = 2
-"""Seconds between reads of a session's rows while any lacks a validation result."""
+_IMPORT_POLL_SECONDS = 2
+"""Seconds between reads of a session that does not yet hold the imported rows."""
 
-_VALIDATION_WAIT_SECONDS = 120
+_IMPORT_WAIT_SECONDS = 120
+"""Seconds to wait for a session to hold the imported rows before giving up."""
+
+_REPORT_POLL_SECONDS = 2
+"""Seconds between reads of a table whose validation report does not yet cover it."""
+
+_REPORT_WAIT_SECONDS = 120
 """Seconds to keep reading before reporting rows Synapse has not validated."""
+
+
+class _FillError(Exception):
+    """A fill step finished, but not as the write needs; the message says how."""
+
 
 _COLUMN_TYPES = {
     "string": ColumnType.STRING,
@@ -1214,28 +1243,6 @@ _COLUMN_TYPES = {
     "number": ColumnType.DOUBLE,
     "boolean": ColumnType.BOOLEAN,
 }
-
-
-class _FillError(Exception):
-    """A fill step finished, but not as the write needs; the message says how."""
-
-
-class _FillResult(NamedTuple):
-    """What filling a table through a grid session found.
-
-    Attributes:
-        session_id: The grid session used, deleted by the time this is returned.
-        rows: The session's rows, with their validation results, as the last read
-            gave them.
-        unvalidated: How many rows had no validation result when the wait ran out:
-            those in `rows` without one, and those imported but not in `rows`.
-        sync_errors: The synchronize's error messages; empty when it had none.
-    """
-
-    session_id: str
-    rows: list[GridRow]
-    unvalidated: int
-    sync_errors: list[str]
 
 
 def _column_types(
@@ -1269,146 +1276,246 @@ def _column_types(
     return types
 
 
-async def _read_session_rows(
-    grid: Grid, imported: int, synapse_client: Synapse
-) -> tuple[list[GridRow], int]:
-    """Read every row of a connected session with its validation results.
+def _cell_text(value: Any) -> str:
+    """A grid row's value as text: None as empty, a string as it is, anything else
+    as JSON."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
 
-    Rows are read a page at a time until a short page. A session can return no
-    rows, or rows without results, for a moment after an import, so the read
-    repeats while it returns fewer rows than were imported or any row lacks a
-    result, until `_VALIDATION_WAIT_SECONDS` have passed.
 
-    Arguments:
-        grid: The connected session.
-        imported: How many rows the import counted.
-        synapse_client: The client.
-
-    Returns:
-        The rows of the last read, and how many rows have no result: those read
-        without one, and those imported but not read.
-    """
-    deadline = time.monotonic() + _VALIDATION_WAIT_SECONDS
+async def _read_session(
+    grid: Grid, key_columns: list[str], synapse_client: Synapse
+) -> _Table:
+    """Every row of a connected session, read a page at a time until a short page,
+    as a table of text cells whose header holds the key columns and every column
+    a row has."""
+    rows: list[GridRow] = []
     while True:
-        rows: list[GridRow] = []
+        result = await grid.validate_rows_async(
+            query_request=QueryRequest(
+                query=GridQuery(
+                    column_selection=[SelectAll()],
+                    limit=_SESSION_PAGE_SIZE,
+                    offset=len(rows),
+                )
+            ),
+            synapse_client=synapse_client,
+        )
+        page = (result.rows if result is not None else None) or []
+        rows.extend(page)
+        if len(page) < _SESSION_PAGE_SIZE:
+            break
+    header = list(key_columns)
+    for row in rows:
+        header.extend(column for column in row.data or {} if column not in header)
+    records = [
+        CsvRecord(
+            line=0,
+            cells=[_cell_text((row.data or {}).get(column)) for column in header],
+        )
+        for row in rows
+    ]
+    return _Table(header=header, records=records, upsert_keys=[], parent_id=None)
+
+
+async def _wait_for_import(
+    outcome: TaskOutcome,
+    written: list[_RowWrite],
+    grid: Grid,
+    types: dict[str, str],
+    synapse_client: Synapse,
+) -> None:
+    """Wait until a session holds the rows imported into it (research R12).
+
+    Synapse applies an import to the session a moment after the import job
+    returns, and a push before then leaves the rows out. The connected session is
+    read until it holds every written key and every overwritten cell, by
+    `_check_read_back`, until `_IMPORT_WAIT_SECONDS` have passed.
+
+    Raises:
+        _FillError: When the session still lacks a written row or value.
+    """
+    holder = f"grid session {grid.session_id}"
+    deadline = time.monotonic() + _IMPORT_WAIT_SECONDS
+    async with grid.connect_async(synapse_client=synapse_client) as session:
         while True:
-            result = await grid.validate_rows_async(
-                query_request=QueryRequest(
-                    query=GridQuery(
-                        column_selection=[SelectAll()],
-                        limit=_VALIDATION_PAGE_SIZE,
-                        offset=len(rows),
-                        include_validation_messages=True,
-                    )
-                ),
-                synapse_client=synapse_client,
+            table = await _read_session(
+                session, outcome.plan.key_columns, synapse_client
             )
-            page = (result.rows if result is not None else None) or []
-            rows.extend(page)
-            if len(page) < _VALIDATION_PAGE_SIZE:
-                break
-        unvalidated = sum(1 for row in rows if row.validation_results is None)
-        unvalidated += max(0, imported - len(rows))
-        if not unvalidated or time.monotonic() >= deadline:
-            return rows, unvalidated
-        await asyncio.sleep(_VALIDATION_POLL_SECONDS)
+            errors = _check_read_back(outcome, written, table, types, holder)
+            if not errors:
+                return
+            if time.monotonic() >= deadline:
+                raise _FillError(
+                    f"{holder} did not hold the imported rows after "
+                    f"{_IMPORT_WAIT_SECONDS} seconds, so it was not synchronized "
+                    f"and table {outcome.record_set_id} is unchanged: "
+                    + "; ".join(errors)
+                )
+            await asyncio.sleep(_IMPORT_POLL_SECONDS)
 
 
 async def _fill_table(
-    record_set_id: str,
-    columns: list[str],
-    rows: list[dict[str, str]],
+    outcome: TaskOutcome,
+    written: list[_RowWrite],
     schema_body: dict[str, Any],
+    types: dict[str, str],
     synapse_client: Synapse,
-) -> _FillResult:
-    """Write rows to a table through a grid session of its own (research R12).
+) -> None:
+    """Write rows to the outcome's table through a grid session of its own
+    (research R12).
 
-    The rows go to a temporary CSV under `columns`, every cell quoted and a missing
-    cell written as `""`. A new session on the RecordSet imports it, typed from the
-    schema; is read until every row has a validation result; and is synchronized
-    with `PULL_PUSH`. The session is never attached to a task. The session and the
-    CSV are removed whatever happens; a session that cannot be deleted is logged.
-
-    Arguments:
-        record_set_id: The table's RecordSet.
-        columns: The table's header.
-        rows: The rows to write, each a mapping of column to text.
-        schema_body: The bound schema's body, which types the import.
-        synapse_client: The client.
-
-    Returns:
-        The session's rows and the synchronize's errors.
+    The rows go to a temporary CSV under the table's header, every cell quoted and
+    a missing cell written as `""`. A new session on the RecordSet imports it,
+    typed from the schema; is waited for until it holds the rows; and is
+    synchronized with `PULL_PUSH`, which makes Synapse validate the new RecordSet
+    version. The session is never attached to a task. The session and the CSV are
+    removed whatever happens; a session that cannot be deleted is logged.
 
     Raises:
-        _FillError: When the import counts other than `len(rows)` rows; the session
-            is then not synchronized.
+        _FillError: When the session never holds the imported rows; it is then not
+            synchronized.
     """
-    descriptor, csv_path = tempfile.mkstemp(prefix="curation_task_", suffix=".csv")
+    record_set_id = outcome.record_set_id
+    columns = outcome.plan.table_columns
     grid = Grid(record_set_id=record_set_id)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as file:
-            writer = csv.writer(file, quoting=csv.QUOTE_ALL)
-            writer.writerow(columns)
-            writer.writerows(
-                [row.get(column, "") for column in columns] for row in rows
-            )
-
-        await grid.create_async(synapse_client=synapse_client)
-        await grid.import_csv_async(
-            path=csv_path,
-            column_types=_column_types(schema_body, columns),
-            synapse_client=synapse_client,
-        )
-        imported = grid.import_total_count
-        if imported != len(rows):
-            raise _FillError(
-                f"grid session {grid.session_id} imported "
-                f"{_count(imported or 0, 'row')}, not the {len(rows)} written; it "
-                f"was not synchronized, so table {record_set_id} is unchanged"
-            )
-        async with grid.connect_async(synapse_client=synapse_client) as session:
-            session_rows, unvalidated = await _read_session_rows(
-                session, imported, synapse_client
-            )
-        await grid.synchronize_async(
-            sync_type=SyncType.PULL_PUSH, synapse_client=synapse_client
-        )
-        return _FillResult(
-            session_id=grid.session_id,
-            rows=session_rows,
-            unvalidated=unvalidated,
-            sync_errors=list(grid.sync_error_messages or []),
-        )
-    finally:
-        Path(csv_path).unlink(missing_ok=True)
-        if grid.session_id:
-            try:
-                await grid.delete_async(synapse_client=synapse_client)
-            except Exception as error:
-                synapse_client.logger.warning(
-                    f"Could not delete grid session {grid.session_id} on table "
-                    f"{record_set_id}: {error}"
+    with tempfile.TemporaryDirectory(prefix="curation_task_") as folder:
+        csv_path = os.path.join(folder, "rows.csv")
+        try:
+            with open(csv_path, "w", encoding="utf-8", newline="") as file:
+                writer = csv.writer(file, quoting=csv.QUOTE_ALL)
+                writer.writerow(columns)
+                writer.writerows(
+                    [row.cells.get(column, "") for column in columns] for row in written
                 )
 
+            await grid.create_async(synapse_client=synapse_client)
+            await grid.import_csv_async(
+                path=csv_path,
+                column_types=_column_types(schema_body, columns),
+                synapse_client=synapse_client,
+            )
+            await _wait_for_import(outcome, written, grid, types, synapse_client)
+            await grid.synchronize_async(
+                sync_type=SyncType.PULL_PUSH, synapse_client=synapse_client
+            )
+        finally:
+            if grid.session_id:
+                try:
+                    await grid.delete_async(synapse_client=synapse_client)
+                except Exception as error:
+                    synapse_client.logger.warning(
+                        f"Could not delete grid session {grid.session_id} on "
+                        f"table {record_set_id}: {error}"
+                    )
 
-async def _read_table(record_set_id: str, synapse_client: Synapse) -> _Table:
+
+async def _read_table(
+    record_set_id: str, synapse_client: Synapse, with_report: bool = False
+) -> _Table:
     """Read a table without a grid session (research R10): download its RecordSet to
     a temporary folder, removed before returning, and read the CSV.
 
+    Arguments:
+        record_set_id: The table's RecordSet.
+        synapse_client: The client.
+        with_report: Also download the RecordSet's validation report, when it has
+            one (research R12).
+
     Returns:
-        The table's header, records, upsert keys and folder.
+        The table's header, records, upsert keys and folder, and its validation
+        report when asked for and present.
     """
+    report = None
     with tempfile.TemporaryDirectory(prefix="curation_task_") as folder:
         record_set = await RecordSet(id=record_set_id, path=folder).get_async(
             synapse_client=synapse_client
         )
         header, records = read_csv_records(record_set.path)
+        if with_report and record_set.validation_file_handle_id:
+            results = await record_set.get_detailed_validation_results_async(
+                download_location=folder, synapse_client=synapse_client
+            )
+            if results is not None:
+                report = _report_rows(results)
     return _Table(
         header=header,
         records=records,
         upsert_keys=list(record_set.upsert_keys or []),
         parent_id=record_set.parent_id,
+        report=report,
     )
+
+
+def _report_bool(value: Any) -> bool | None:
+    """A report's `is_valid` cell as a bool, or None when it holds neither."""
+    text = str(value).strip().lower()
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    return None
+
+
+def _report_messages(value: Any) -> list[str]:
+    """A report's message cell as a list: a JSON list's text entries, other text as
+    one message, and anything else (a missing cell) as none."""
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        items = json.loads(value)
+    except ValueError:
+        return [value]
+    if isinstance(items, list):
+        return [item for item in items if isinstance(item, str) and item]
+    return [value]
+
+
+def _report_rows(results: DATA_FRAME_TYPE) -> list[_ReportRow]:
+    """A RecordSet's validation report, one entry per row it names."""
+    rows = []
+    for record in results.to_dict("records"):
+        try:
+            index = int(record.get("row_index"))
+        except (TypeError, ValueError):
+            continue
+        messages = []
+        for message in [
+            *_report_messages(record.get("validation_error_message")),
+            *_report_messages(record.get("all_validation_messages")),
+        ]:
+            if message not in messages:
+                messages.append(message)
+        rows.append(
+            _ReportRow(
+                index=index,
+                is_valid=_report_bool(record.get("is_valid")),
+                messages=messages,
+            )
+        )
+    return rows
+
+
+def _report_covers(table: _Table) -> bool:
+    """Whether a table's validation report has one row for each of its rows."""
+    return table.report is not None and sorted(
+        row.index for row in table.report
+    ) == list(range(len(table.records)))
+
+
+async def _read_written_table(record_set_id: str, synapse_client: Synapse) -> _Table:
+    """Read a table just written, with its validation report, reading again while
+    the report does not cover the table, until `_REPORT_WAIT_SECONDS` have passed
+    (research R12)."""
+    deadline = time.monotonic() + _REPORT_WAIT_SECONDS
+    while True:
+        table = await _read_table(record_set_id, synapse_client, with_report=True)
+        if _report_covers(table) or time.monotonic() >= deadline:
+            return table
+        await asyncio.sleep(_REPORT_POLL_SECONDS)
 
 
 async def _bound_schema_uri(record_set_id: str, synapse_client: Synapse) -> str | None:
@@ -1428,28 +1535,18 @@ async def _bound_schema_uri(record_set_id: str, synapse_client: Synapse) -> str 
 # Applying
 
 
-def _cell_text(value: Any) -> str:
-    """A grid row's value as text: None as empty, a string as it is, anything else
-    as JSON."""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    return json.dumps(value)
-
-
 def _validation_problems(
     outcome: TaskOutcome,
     written: list[_RowWrite],
-    fill: _FillResult,
+    table: _Table,
     types: dict[str, str],
 ) -> list[CurationProblem]:
-    """The session's invalid rows as non-blocking validation problems.
+    """The invalid rows of a table's validation report as non-blocking validation
+    problems (research R12).
 
     A row is named by its key values, and by its input file and line when a written
-    row has that key. Its message is Synapse's one-line message followed by each of
-    its detailed messages. Rows Synapse had not validated in time add one problem
-    saying how many.
+    row has that key. Its message is Synapse's messages joined. Rows the report does
+    not cover, or covers without a result, add one problem saying how many.
     """
     plan = outcome.plan
     row = plan.row
@@ -1458,21 +1555,13 @@ def _validation_problems(
         _row_key(written_row.cells, plan.key_columns, types): written_row.line
         for written_row in written
     }
+    report = table.report if _report_covers(table) else []
     problems = []
-    for grid_row in fill.rows:
-        results = grid_row.validation_results
-        if results is None or results.is_valid is not False:
+    for result in report:
+        if result.is_valid is not False:
             continue
-        data = grid_row.data or {}
-        key = {column: _cell_text(data.get(column)) for column in plan.key_columns}
-        messages = "; ".join(
-            message
-            for message in [
-                results.validation_error_message,
-                *(results.all_validation_messages or []),
-            ]
-            if message
-        )
+        cells = _record_cells(table.header, table.records[result.index])
+        key = {column: cells.get(column, "") for column in plan.key_columns}
         line = lines.get(_row_key(key, plan.key_columns, types))
         if line is None:
             where = f"table row with key {_describe_key(key)}"
@@ -1483,23 +1572,28 @@ def _validation_problems(
                 task=row.name,
                 kind=ProblemKind.VALIDATION,
                 blocking=False,
-                message=f"{row.name}: {where}: {messages}",
+                message=f"{row.name}: {where}: {'; '.join(result.messages)}",
                 file=None if line is None else file,
                 line=line,
                 key=key,
             )
         )
-    if fill.unvalidated:
+    unvalidated = (
+        sum(1 for result in report if result.is_valid is None)
+        if report
+        else len(table.records)
+    )
+    if unvalidated:
         problems.append(
             CurationProblem(
                 task=row.name,
                 kind=ProblemKind.VALIDATION,
                 blocking=False,
                 message=(
-                    f"{row.name}: Synapse had not validated {fill.unvalidated} of "
-                    f"the {_count(max(len(fill.rows), len(written)), 'row')} in table "
-                    f"{outcome.record_set_id} after {_VALIDATION_WAIT_SECONDS} "
-                    "seconds; their validation problems are not reported"
+                    f"{row.name}: Synapse had not validated {unvalidated} of the "
+                    f"{_count(len(table.records), 'row')} in table "
+                    f"{outcome.record_set_id} after {_REPORT_WAIT_SECONDS} seconds; "
+                    "their validation problems are not reported"
                 ),
             )
         )
@@ -1511,24 +1605,23 @@ def _check_read_back(
     written: list[_RowWrite],
     table: _Table,
     types: dict[str, str],
+    holder: str | None = None,
 ) -> list[str]:
     """Check the table read back after a write holds every row written, and every
     overwritten cell the value written (FR-019).
 
-    Keys and cells compare by `_cells_equal`'s typing.
+    Keys and cells compare by `_cells_equal`'s typing. `holder` names what was
+    read in the messages; the outcome's table by default.
 
     Returns:
         One error per key column the table's header lacks, or else one per written
         key the table lacks and one per overwritten cell holding another value.
     """
     plan = outcome.plan
-    table_id = outcome.record_set_id
+    holder = holder or f"table {outcome.record_set_id}"
     absent = [column for column in plan.key_columns if column not in table.header]
     if absent:
-        return [
-            f"table {table_id} read back has no key column '{column}'"
-            for column in absent
-        ]
+        return [f"{holder} read back has no key column '{column}'" for column in absent]
     present: dict[tuple[Hashable, ...], dict[str, str]] = {}
     for record in table.records:
         cells = _record_cells(table.header, record)
@@ -1541,14 +1634,14 @@ def _check_read_back(
         )
         stored = present.get(_row_key(row.cells, plan.key_columns, types))
         if stored is None:
-            errors.append(f"{where} is not in table {table_id} after writing")
+            errors.append(f"{where} is not in {holder} after writing")
             continue
         for column, value in row.overwritten.items():
             held = stored.get(column, "")
             if not _cells_equal(value, held, types.get(column)):
                 errors.append(
-                    f"{where}: column '{column}' holds '{held}' in table {table_id} "
-                    f"after writing, not '{value}'"
+                    f"{where}: column '{column}' holds '{held}' in {holder} after "
+                    f"writing, not '{value}'"
                 )
     return errors
 
@@ -1570,13 +1663,7 @@ async def _write_rows(
     try:
         schema = await lookups.schema(plan.row.schema_uri)
         types = schema.types
-        fill = await _fill_table(
-            record_set_id,
-            plan.table_columns,
-            [row.cells for row in written],
-            schema.body,
-            client,
-        )
+        await _fill_table(outcome, written, schema.body, types, client)
     except _FillError as error:
         outcome.errors.append(str(error))
     except Exception as error:
@@ -1584,24 +1671,18 @@ async def _write_rows(
             f"Synapse error while filling table {record_set_id}: {error}"
         )
     else:
-        outcome.validation_problems = _validation_problems(
-            outcome, written, fill, types
-        )
-        outcome.errors.extend(
-            f"synchronizing grid session {fill.session_id} into table "
-            f"{record_set_id} failed: {message}"
-            for message in fill.sync_errors
-        )
-        if not fill.sync_errors:
-            outcome.rows_written = len(written)
-            try:
-                table = await _read_table(record_set_id, client)
-            except Exception as error:
-                outcome.errors.append(
-                    f"Synapse error while reading table {record_set_id} back: {error}"
-                )
-            else:
-                outcome.errors.extend(_check_read_back(outcome, written, table, types))
+        outcome.rows_written = len(written)
+        try:
+            table = await _read_written_table(record_set_id, client)
+        except Exception as error:
+            outcome.errors.append(
+                f"Synapse error while reading table {record_set_id} back: {error}"
+            )
+        else:
+            outcome.errors.extend(_check_read_back(outcome, written, table, types))
+            outcome.validation_problems = _validation_problems(
+                outcome, written, table, types
+            )
     if outcome.errors:
         outcome.result = TaskResult.FAILED
 
