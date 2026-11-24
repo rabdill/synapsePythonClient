@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from synapseclient import Synapse
-from synapseclient.core.exceptions import SynapseHTTPError
+from synapseclient.core.exceptions import SynapseError, SynapseHTTPError
 from synapseclient.core.models.permission import Permissions
 from synapseclient.extensions.curator import curation_tasks
 from synapseclient.extensions.curator.curation_task_types import (
@@ -645,6 +645,7 @@ class _SynapseMocks:
         self.report_index = 0
         self.report: list[dict] | None = None
         self.sync_types = []
+        self.sync_errors: list[str] = []
         self.deleted_sessions: list[str] = []
         self.table_text: str | None = None
         self.read_ids: list[str] = []
@@ -742,6 +743,14 @@ class _SynapseMocks:
         async def synchronize(grid: Grid, **kwargs) -> Grid:
             step("synchronize")
             self.sync_types.append(kwargs.get("sync_type"))
+            if self.sync_errors:
+                # As Grid.synchronize_async: raised only when asked, else logged
+                if kwargs.get("raise_on_error"):
+                    raise SynapseError(
+                        f"Grid session '{grid.session_id}' was only partially "
+                        "synchronized: " + "; ".join(self.sync_errors)
+                    )
+                return grid
             self._synchronized()
             return grid
 
@@ -2204,6 +2213,27 @@ class TestApplyNewTasks(_SynapseMocks):
         # AND every session opened was deleted, and no temporary file is left
         opened = ["session-1"] if step != "grid.create" else []
         assert self.deleted_sessions == opened + ["session-2"]
+        self._assert_nothing_deleted_and_no_file_left()
+
+    async def test_partial_synchronize_fails_the_task(self, tmp_path: Path) -> None:
+        # GIVEN a synchronize that cannot write one of the rows to the table
+        self.sync_errors = ["Failed to update row: '2'. Error message: x"]
+
+        # WHEN I apply a row
+        (outcome,) = await self._apply(_task_row(tmp_path))
+
+        # THEN the task fails with Synapse's reason, and the table is not read back
+        assert outcome.result is TaskResult.FAILED
+        assert outcome.task_id == 901
+        assert outcome.rows_written == 0
+        assert outcome.errors == [
+            "Synapse error while filling table syn901: Grid session 'session-1' was "
+            "only partially synchronized: Failed to update row: '2'. Error message: x"
+        ]
+        assert self.calls == GRID_FLOW[: GRID_FLOW.index("grid.delete") + 1]
+
+        # AND the session was deleted, and no temporary file is left
+        assert self.deleted_sessions == ["session-1"]
         self._assert_nothing_deleted_and_no_file_left()
 
     @pytest.mark.parametrize("import_fails", [False, True])

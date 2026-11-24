@@ -189,7 +189,7 @@ If a task is blocked, all other tasks go ahead, and **the run exits with status 
 
 Since `--overwrite` writes more rows, `plan --overwrite` may block tasks that `plan` alone does not. A grid session that was deleted in Synapse no longer counts as attached.
 
-A task **fails**, rather than being blocked, when Synapse cannot import its input file, or when the read-back finds a written row missing or an overwritten cell not holding the value written. A failed task archives nothing, and a rerun fills it. When Synapse cannot import the file, nothing is saved to the task's table.
+A task **fails**, rather than being blocked, when Synapse cannot import its input file, when the synchronization reports rows it could not write to the table, or when the read-back finds a written row missing or an overwritten cell not holding the value written. A failed task archives nothing, and a rerun fills it. When Synapse cannot import the file, nothing is saved to the task's table.
 
 ## What the command does not do
 

@@ -1378,6 +1378,8 @@ async def _fill_table(
     Raises:
         _FillError: When the session never holds the imported rows; it is then not
             synchronized.
+        SynapseError: When the synchronization could not write some of the rows to
+            the table. The rest were written and stay.
     """
     record_set_id = outcome.record_set_id
     columns = outcome.plan.table_columns
@@ -1400,7 +1402,9 @@ async def _fill_table(
             )
             await _wait_for_import(outcome, written, grid, types, synapse_client)
             await grid.synchronize_async(
-                sync_type=SyncType.PULL_PUSH, synapse_client=synapse_client
+                sync_type=SyncType.PULL_PUSH,
+                raise_on_error=True,
+                synapse_client=synapse_client,
             )
         finally:
             if grid.session_id:
